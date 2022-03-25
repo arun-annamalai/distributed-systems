@@ -9,19 +9,6 @@ package mr
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // RPC struct definitions for registering a worker
 
 type RegisterWorkerArgs struct {
@@ -47,6 +34,7 @@ type RequestTaskReply struct {
 
 type TaskDoneArgs struct {
 	TaskNumber int
+	IsMapJob   bool
 }
 
 type TaskDoneReply struct {

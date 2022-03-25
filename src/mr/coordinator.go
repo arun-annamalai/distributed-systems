@@ -24,23 +24,24 @@ const (
 
 type Coordinator struct {
 	// Your definitions here.
-	mapJobs            []Job
-	mapJobsM           sync.Mutex
-	reduceJobs         []Job
-	reduceJobsM        sync.Mutex
-	registeredWorkers  map[string]Job
-	registeredWorkersM sync.Mutex
+	mapJobs     []Job
+	mapJobsM    sync.Mutex
+	reduceJobs  []Job
+	reduceJobsM sync.Mutex
 
 	stage  Stage
 	stageM sync.Mutex
 
-	completedReduceJobs  int
+	completedReduceJobs  map[int]bool
 	completedReduceJobsM sync.Mutex
-	completedMapJobs     int
-	completedMapJobsM    sync.Mutex
+
+	completedMapJobs  map[int]bool
+	completedMapJobsM sync.Mutex
 
 	totalReduceJobs int
 	totalMapJobs    int
+
+	taskReassignDuration time.Duration
 }
 
 type Job struct {
@@ -51,78 +52,29 @@ type Job struct {
 	NReduce     int
 }
 
-type concurrentInt struct {
-	value int
-	mutex sync.Mutex
-}
-
-func (c *concurrentInt) setVal(newVal int) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.value = newVal
-
-}
-
-func (c *concurrentInt) getVal(newVal int) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.value = newVal
-}
-
 // Your code here -- RPC handlers for the worker to call.
 
 func (c *Coordinator) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWorkerReply) error {
-	log.Println(args.Uuid)
+	log.Println("worker: " + args.Uuid + " registered by master")
 	reply.Success = true
 	return nil
 }
 
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
-	log.Print("worker: " + args.Uuid + " requesting task\n")
-	reply.WorkerWait = false
-	reply.JobDone = false
-
+	log.Println("master waiting on stage lock")
 	c.stageM.Lock()
 	defer c.stageM.Unlock()
 
+	log.Print("worker: " + args.Uuid + " requesting task" + "Stage: ")
+	log.Printf("%#v\n", c.stage)
+	reply.WorkerWait = false
+	reply.JobDone = false
+
 	if c.stage == Map {
-		c.mapJobsM.Lock()
-		defer c.mapJobsM.Unlock()
-
-		if len(c.mapJobs) == 0 {
-			reply.WorkerWait = true
-			reply.Success = true
-			return nil
-		}
-
-		// assign a job to worker
-		job := c.mapJobs[len(c.mapJobs)-1]
-		job.TimeStarted = time.Now()
-		c.mapJobs = c.mapJobs[0 : len(c.mapJobs)-1]
-		c.registeredWorkersM.Lock()
-		c.registeredWorkers[args.Uuid] = job
-		c.registeredWorkersM.Unlock()
-		reply.Job = job
-		log.Print("\tGiving worker map task: " + job.FileNames[0] + "\n")
+		c.assignJob(&c.mapJobs, &c.mapJobsM, args, reply)
 	} else if c.stage == Reduce {
-		c.reduceJobsM.Lock()
-		defer c.reduceJobsM.Unlock()
-
-		if len(c.reduceJobs) == 0 {
-			reply.WorkerWait = true
-			reply.Success = true
-			return nil
-		}
-
-		// assign a job to worker
-		job := c.reduceJobs[len(c.reduceJobs)-1]
-		job.TimeStarted = time.Now()
-		c.reduceJobs = c.reduceJobs[0 : len(c.reduceJobs)-1]
-		c.registeredWorkers[args.Uuid] = job
-		reply.Job = job
-		log.Printf("\tGiving worker reduce tasks: %#v\n", job.FileNames)
+		log.Println("Here")
+		c.assignJob(&c.reduceJobs, &c.reduceJobsM, args, reply)
 	} else {
 		reply.WorkerWait = true
 	}
@@ -130,44 +82,90 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	return nil
 }
 
-func (c *Coordinator) MapTaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
+func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
+
+	var completedJobListM *sync.Mutex
+	var jobList map[int]bool
+
+	changeStage := false
 	reply.Success = true
-
-	c.completedMapJobsM.Lock()
-	defer c.completedMapJobsM.Unlock()
-
-	c.completedMapJobs += 1
-	// if last map task, then change stage to reduce
-	if c.completedMapJobs == c.totalMapJobs {
-		log.Print("Map stage completed | Creating reduce tasks")
-		err := c.createReduceTasks()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		c.stageM.Lock()
-		c.stage = Reduce
-		c.stageM.Unlock()
+	if args.IsMapJob {
+		completedJobListM = &c.completedMapJobsM
+		jobList = c.completedMapJobs
+	} else {
+		completedJobListM = &c.completedReduceJobsM
+		jobList = c.completedReduceJobs
 	}
+
+	completedJobListM.Lock()
+	jobList[args.TaskNumber] = true
+
+	if args.IsMapJob {
+		if len(jobList) == c.totalMapJobs {
+			log.Println("Map stage completed | Creating reduce tasks")
+			completedJobListM.Unlock()
+			err := c.createReduceTasks()
+			if err != nil {
+				log.Fatal(err)
+			}
+			changeStage = true
+		} else {
+			completedJobListM.Unlock()
+		}
+	} else {
+		if len(c.completedReduceJobs) == c.totalReduceJobs {
+			changeStage = true
+		}
+		completedJobListM.Unlock()
+	}
+
+	if changeStage {
+		c.changeStage()
+	}
+
 	return nil
 }
 
-func (c *Coordinator) ReduceTaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
-	reply.Success = true
+func (c *Coordinator) changeStage() {
+	c.stageM.Lock()
+	defer c.stageM.Unlock()
 
-	c.completedReduceJobsM.Lock()
-	defer c.completedReduceJobsM.Unlock()
-
-	c.completedReduceJobs += 1
-	// if last map task, then change stage to reduce
-	if c.completedReduceJobs == c.totalReduceJobs {
-		log.Print("Reduce stage completed")
-		c.stageM.Lock()
+	if c.stage == Map {
+		log.Println("Changing stage to reduce")
+		c.stage = Reduce
+	} else {
+		log.Println("Changing stage to done")
 		c.stage = Done
-		c.stageM.Unlock()
-
 	}
-	return nil
+
+}
+
+func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, args *RequestTaskArgs, reply *RequestTaskReply) {
+	jobListLock.Lock()
+	if len(*jobList) == 0 {
+		reply.WorkerWait = true
+		reply.Success = true
+		jobListLock.Unlock()
+		return
+	}
+
+	// assign a job to worker
+	job := (*jobList)[len(*jobList)-1]
+	job.TimeStarted = time.Now()
+	*jobList = (*jobList)[0 : len(*jobList)-1]
+	reply.Job = job
+	if len(job.FileNames) == 1 {
+		log.Print("\tGiving worker map task: " + job.FileNames[0] + "\n")
+	} else {
+		log.Printf("\tGiving worker reduce tasks: %#v\n", job.FileNames)
+	}
+	jobListLock.Unlock()
+	//time.Sleep(c.taskReassignDuration)
+	//if !c.completedMapJobs[job.JobNumber] {
+	//	jobListLock.Lock()
+	//	defer jobListLock.Unlock()
+	//	jobList = append(jobList, job)
+	//}
 }
 
 func (c *Coordinator) createReduceTasks() error {
@@ -187,6 +185,7 @@ func (c *Coordinator) createReduceTasks() error {
 		job.NReduce = c.totalReduceJobs
 		c.reduceJobs = append(c.reduceJobs, job)
 	}
+	log.Println("Finished creating reduce tasks")
 	return nil
 }
 
@@ -230,8 +229,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c.totalReduceJobs = nReduce
 	c.stage = Map
-	c.completedMapJobs = 0
-	c.completedReduceJobs = 0
+	c.completedMapJobs = make(map[int]bool)
+	c.completedReduceJobs = make(map[int]bool)
 	sort.Strings(files)
 	for idx, file := range files {
 		job := Job{}
@@ -241,21 +240,11 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		job.NReduce = nReduce
 		c.mapJobs = append(c.mapJobs, job)
 	}
-	c.registeredWorkers = make(map[string]Job)
 	c.totalMapJobs = len(files)
+	c.taskReassignDuration = time.Duration(10) * time.Second
 
 	c.server()
 	log.Print("Coordinator running...\n")
 	log.Printf("\t %d files found", c.totalMapJobs)
 	return &c
-}
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
 }

@@ -64,6 +64,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			return
 		}
 		if requestTaskReply.WorkerWait {
+			log.Println("Worker: " + Uuid + " waiting")
 			time.Sleep(3000 * time.Millisecond)
 			continue
 		}
@@ -126,6 +127,14 @@ func doTask(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string, requestTaskReply RequestTaskReply) {
 	log.Printf("Worker doing task\n")
 
+	// declare an argument structure.
+	args := TaskDoneArgs{}
+	args.TaskNumber = requestTaskReply.Job.JobNumber
+	args.IsMapJob = requestTaskReply.Job.IsMapJob
+
+	// declare a reply structure.
+	reply := TaskDoneReply{}
+
 	if requestTaskReply.Job.IsMapJob {
 		filename := requestTaskReply.Job.FileNames[0]
 		file, err := os.Open(filename)
@@ -159,14 +168,7 @@ func doTask(mapf func(string, string) []KeyValue,
 			}
 		}
 
-		// declare an argument structure.
-		args := TaskDoneArgs{}
-		args.TaskNumber = mapTaskNumber
-
-		// declare a reply structure.
-		reply := TaskDoneReply{}
-
-		ok := call("Coordinator.MapTaskDone", &args, &reply)
+		ok := call("Coordinator.TaskDone", &args, &reply)
 		if ok {
 			log.Printf("reply.Success %v\n", reply.Success)
 		} else {
@@ -240,14 +242,7 @@ func doTask(mapf func(string, string) []KeyValue,
 			log.Fatal(err)
 		}
 
-		// declare an argument structure.
-		args := TaskDoneArgs{}
-		args.TaskNumber = reduceTaskNumber
-
-		// declare a reply structure.
-		reply := TaskDoneReply{}
-
-		ok := call("Coordinator.ReduceTaskDone", &args, &reply)
+		ok := call("Coordinator.TaskDone", &args, &reply)
 		if ok {
 			log.Printf("reply.Success %v\n", reply.Success)
 		} else {
@@ -279,33 +274,4 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	log.Println(err)
 	return false
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		log.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		log.Printf("call failed!\n")
-	}
 }
