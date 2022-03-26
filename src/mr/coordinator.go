@@ -22,6 +22,12 @@ const (
 	Done
 )
 
+const (
+	logging         bool = false
+	faultTolerance       = false
+	faultTolerance2      = false
+)
+
 type Coordinator struct {
 	// Your definitions here.
 	mapJobs     []Job
@@ -32,24 +38,32 @@ type Coordinator struct {
 	stage  Stage
 	stageM sync.Mutex
 
-	completedReduceJobs  map[int]bool
+	completedReduceJobs  *set
 	completedReduceJobsM sync.Mutex
 
-	completedMapJobs  map[int]bool
+	completedMapJobs  *set
 	completedMapJobsM sync.Mutex
 
 	totalReduceJobs int
 	totalMapJobs    int
 
-	taskReassignDuration time.Duration
+	taskReassignDuration int64
+
+	//registeredWorkers  map[string]Job
+	//registeredWorkersM sync.Mutex
 }
 
 type Job struct {
-	FileNames   []string
-	TimeStarted time.Time
-	IsMapJob    bool
-	JobNumber   int
-	NReduce     int
+	FileNames            []string
+	TimeStarted          time.Time
+	IsMapJob             bool
+	JobNumber            int
+	NReduce              int
+	taskReassignDuration int64
+}
+
+func (j *Job) isExpired() bool {
+	return time.Since(j.TimeStarted).Milliseconds() > j.taskReassignDuration
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -63,19 +77,19 @@ func (c *Coordinator) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWo
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
 	log.Println("master waiting on stage lock")
 	c.stageM.Lock()
-	defer c.stageM.Unlock()
 
-	log.Print("worker: " + args.Uuid + " requesting task" + "Stage: ")
-	log.Printf("%#v\n", c.stage)
+	log.Printf("worker: "+args.Uuid+" requesting task "+"Stage: %#v", c.stage)
 	reply.WorkerWait = false
 	reply.JobDone = false
 
 	if c.stage == Map {
-		c.assignJob(&c.mapJobs, &c.mapJobsM, args, reply)
+		c.stageM.Unlock()
+		c.assignJob(&c.mapJobs, &c.mapJobsM, c.completedMapJobs, &c.completedMapJobsM, args, reply)
 	} else if c.stage == Reduce {
-		log.Println("Here")
-		c.assignJob(&c.reduceJobs, &c.reduceJobsM, args, reply)
+		c.stageM.Unlock()
+		c.assignJob(&c.reduceJobs, &c.reduceJobsM, c.completedReduceJobs, &c.completedReduceJobsM, args, reply)
 	} else {
+		c.stageM.Unlock()
 		reply.WorkerWait = true
 	}
 	reply.Success = true
@@ -83,25 +97,31 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 }
 
 func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
-
 	var completedJobListM *sync.Mutex
-	var jobList map[int]bool
+	var completedJobSet *set
 
 	changeStage := false
 	reply.Success = true
 	if args.IsMapJob {
 		completedJobListM = &c.completedMapJobsM
-		jobList = c.completedMapJobs
+		completedJobSet = c.completedMapJobs
 	} else {
 		completedJobListM = &c.completedReduceJobsM
-		jobList = c.completedReduceJobs
+		completedJobSet = c.completedReduceJobs
 	}
 
 	completedJobListM.Lock()
-	jobList[args.TaskNumber] = true
+
+	// handle repeat jobs successful
+	if completedJobSet.Contains(args.TaskNumber) {
+		completedJobListM.Unlock()
+		return nil
+	}
+
+	completedJobSet.Add(args.TaskNumber)
 
 	if args.IsMapJob {
-		if len(jobList) == c.totalMapJobs {
+		if completedJobSet.Size() == c.totalMapJobs {
 			log.Println("Map stage completed | Creating reduce tasks")
 			completedJobListM.Unlock()
 			err := c.createReduceTasks()
@@ -113,7 +133,8 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 			completedJobListM.Unlock()
 		}
 	} else {
-		if len(c.completedReduceJobs) == c.totalReduceJobs {
+		if completedJobSet.Size() == c.totalReduceJobs {
+			log.Printf("\tThis is the state of completed reducejobs: %#v\n", completedJobSet)
 			changeStage = true
 		}
 		completedJobListM.Unlock()
@@ -140,7 +161,8 @@ func (c *Coordinator) changeStage() {
 
 }
 
-func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, args *RequestTaskArgs, reply *RequestTaskReply) {
+func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, completedJobs *set, completedJobsM *sync.Mutex, args *RequestTaskArgs, reply *RequestTaskReply) {
+	//c.registeredWorkersM.Lock()
 	jobListLock.Lock()
 	if len(*jobList) == 0 {
 		reply.WorkerWait = true
@@ -154,18 +176,28 @@ func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, args *R
 	job.TimeStarted = time.Now()
 	*jobList = (*jobList)[0 : len(*jobList)-1]
 	reply.Job = job
+
+	//c.registeredWorkers[args.Uuid] = job
+	//c.registeredWorkersM.Unlock()
 	if len(job.FileNames) == 1 {
 		log.Print("\tGiving worker map task: " + job.FileNames[0] + "\n")
 	} else {
 		log.Printf("\tGiving worker reduce tasks: %#v\n", job.FileNames)
 	}
 	jobListLock.Unlock()
-	//time.Sleep(c.taskReassignDuration)
-	//if !c.completedMapJobs[job.JobNumber] {
-	//	jobListLock.Lock()
-	//	defer jobListLock.Unlock()
-	//	jobList = append(jobList, job)
+
+	//if faultTolerance {
+	//	time.Sleep(c.taskReassignDuration)
+	//	completedJobsM.Lock()
+	//	defer completedJobsM.Unlock()
+	//
+	//	if !completedJobs.Contains(job.JobNumber) {
+	//		jobListLock.Lock()
+	//		defer jobListLock.Unlock()
+	//		*jobList = append(*jobList, job)
+	//	}
 	//}
+
 }
 
 func (c *Coordinator) createReduceTasks() error {
@@ -183,11 +215,61 @@ func (c *Coordinator) createReduceTasks() error {
 		job.JobNumber = i
 		job.IsMapJob = false
 		job.NReduce = c.totalReduceJobs
+		job.taskReassignDuration = c.taskReassignDuration
 		c.reduceJobs = append(c.reduceJobs, job)
 	}
 	log.Println("Finished creating reduce tasks")
 	return nil
 }
+
+//func (c *Coordinator) faultTolerance() {
+//
+//	for {
+//		// TODO: Look here
+//		c.stageM.Lock()
+//		stage := c.stage
+//		c.stageM.Unlock()
+//
+//		if stage == Done {
+//			break
+//		}
+//
+//		c.registeredWorkersM.Lock()
+//
+//		for _, job := range c.registeredWorkers {
+//
+//			var completedJobListM *sync.Mutex
+//			var completedJobSet *set
+//			var jobListM *sync.Mutex
+//			var jobList *[]Job
+//
+//			if job.IsMapJob {
+//				completedJobListM = &c.completedMapJobsM
+//				completedJobSet = c.completedMapJobs
+//				jobListM = &c.mapJobsM
+//				jobList = &c.mapJobs
+//
+//			} else {
+//				completedJobListM = &c.completedReduceJobsM
+//				completedJobSet = c.completedReduceJobs
+//				jobListM = &c.reduceJobsM
+//				jobList = &c.reduceJobs
+//			}
+//
+//			completedJobListM.Lock()
+//
+//			if job.isExpired() && !completedJobSet.Contains(job.JobNumber) {
+//				jobListM.Lock()
+//				*jobList = append(*jobList, job)
+//				jobListM.Unlock()
+//			}
+//
+//			completedJobListM.Unlock()
+//		}
+//		c.registeredWorkersM.Unlock()
+//		time.Sleep(1)
+//	}
+//}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -222,15 +304,18 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	log.SetFlags(0)
-	log.SetOutput(ioutil.Discard)
+	if !logging {
+		log.SetFlags(0)
+		log.SetOutput(ioutil.Discard)
+	}
+
 	c := Coordinator{}
 
 	// Your code here.
 	c.totalReduceJobs = nReduce
 	c.stage = Map
-	c.completedMapJobs = make(map[int]bool)
-	c.completedReduceJobs = make(map[int]bool)
+	c.completedMapJobs = NewSet()
+	c.completedReduceJobs = NewSet()
 	sort.Strings(files)
 	for idx, file := range files {
 		job := Job{}
@@ -238,13 +323,45 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		job.JobNumber = idx
 		job.IsMapJob = true
 		job.NReduce = nReduce
+		job.taskReassignDuration = c.taskReassignDuration
 		c.mapJobs = append(c.mapJobs, job)
 	}
 	c.totalMapJobs = len(files)
-	c.taskReassignDuration = time.Duration(10) * time.Second
+	c.taskReassignDuration = 10 * 1000
+	//c.registeredWorkers = make(map[string]Job)
 
 	c.server()
 	log.Print("Coordinator running...\n")
 	log.Printf("\t %d files found", c.totalMapJobs)
 	return &c
+}
+
+type set struct {
+	m map[int]bool
+}
+
+func NewSet() *set {
+	s := &set{}
+	s.m = make(map[int]bool)
+	return s
+}
+
+func (s *set) Add(value int) {
+	s.m[value] = true
+}
+
+func (s *set) Remove(value int) {
+	delete(s.m, value)
+}
+
+func (s *set) Contains(value int) bool {
+	_, exists := s.m[value]
+	if !exists {
+		delete(s.m, value)
+	}
+	return exists
+}
+
+func (s *set) Size() int {
+	return len(s.m)
 }

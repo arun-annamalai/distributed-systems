@@ -44,8 +44,10 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	log.SetFlags(0)
-	log.SetOutput(ioutil.Discard)
+	if !logging {
+		log.SetFlags(0)
+		log.SetOutput(ioutil.Discard)
+	}
 	// Your worker implementation here.
 
 	Uuid := uuid.New().String()
@@ -135,6 +137,12 @@ func doTask(mapf func(string, string) []KeyValue,
 	// declare a reply structure.
 	reply := TaskDoneReply{}
 
+	wd, err := os.Getwd()
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if requestTaskReply.Job.IsMapJob {
 		filename := requestTaskReply.Job.FileNames[0]
 		file, err := os.Open(filename)
@@ -148,11 +156,13 @@ func doTask(mapf func(string, string) []KeyValue,
 		file.Close()
 		kva := mapf(filename, string(content))
 		mapTaskNumber := requestTaskReply.Job.JobNumber
+		fileCache := newFileCache()
 
 		for _, kv := range kva {
 			reduceTaskNumber := ihash(kv.Key) % requestTaskReply.Job.NReduce
 			reduceFileName := fmt.Sprintf("mr-%d-%d", mapTaskNumber, reduceTaskNumber)
-			file, err := os.OpenFile(reduceFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			file, err := fileCache.open(reduceFileName)
+			//file, err := os.OpenFile(reduceFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -162,11 +172,12 @@ func doTask(mapf func(string, string) []KeyValue,
 				log.Printf("cannot write to map encoder file %v", file)
 				log.Fatal(err)
 			}
-			err = file.Close()
-			if err != nil {
-				log.Fatal(err)
-			}
+			//err = file.Close()
+			//if err != nil {
+			//	log.Fatal(err)
+			//}
 		}
+		fileCache.renameAndCloseAll()
 
 		ok := call("Coordinator.TaskDone", &args, &reply)
 		if ok {
@@ -198,12 +209,6 @@ func doTask(mapf func(string, string) []KeyValue,
 		}
 
 		sort.Sort(ByKey(intermediate))
-
-		wd, err := os.Getwd()
-
-		if err != nil {
-			log.Fatal(err)
-		}
 
 		ofile, err := os.CreateTemp(wd, fmt.Sprintf("temp-reducer-file-%d", reduceTaskNumber))
 		if err != nil {
@@ -274,4 +279,46 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	log.Println(err)
 	return false
+}
+
+type fileCache struct {
+	m  map[string]*os.File
+	wd string
+}
+
+func newFileCache() *fileCache {
+	f := &fileCache{}
+	f.m = make(map[string]*os.File)
+	wd, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
+	f.wd = wd
+	return f
+}
+
+func (f *fileCache) open(fileName string) (*os.File, error) {
+	_, exists := f.m[fileName]
+	// populate cache
+	if !exists {
+		file, err := os.CreateTemp(f.wd, fmt.Sprintf("temp-mapper-file"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		f.m[fileName] = file
+	}
+	return f.m[fileName], nil
+}
+
+func (f *fileCache) renameAndCloseAll() {
+	for name, tempFile := range f.m {
+		err := os.Rename(tempFile.Name(), name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = tempFile.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 }
