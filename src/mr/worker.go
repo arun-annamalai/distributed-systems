@@ -44,7 +44,7 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	if !logging {
+	if !logging_worker {
 		log.SetFlags(0)
 		log.SetOutput(ioutil.Discard)
 	}
@@ -133,7 +133,7 @@ func doTask(mapf func(string, string) []KeyValue,
 	args := TaskDoneArgs{}
 	args.TaskNumber = requestTaskReply.Job.JobNumber
 	args.IsMapJob = requestTaskReply.Job.IsMapJob
-
+	args.Job = requestTaskReply.Job
 	// declare a reply structure.
 	reply := TaskDoneReply{}
 

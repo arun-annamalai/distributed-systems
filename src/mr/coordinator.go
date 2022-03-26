@@ -2,7 +2,6 @@ package mr
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"path/filepath"
 	"sort"
@@ -23,9 +22,10 @@ const (
 )
 
 const (
-	logging         bool = false
+	logging_master  bool = true
+	logging_worker  bool = false
 	faultTolerance       = false
-	faultTolerance2      = false
+	faultTolerance2      = true
 )
 
 type Coordinator struct {
@@ -49,21 +49,22 @@ type Coordinator struct {
 
 	taskReassignDuration int64
 
-	//registeredWorkers  map[string]Job
-	//registeredWorkersM sync.Mutex
+	registeredWorkers  map[string]Job
+	registeredWorkersM sync.Mutex
 }
 
 type Job struct {
 	FileNames            []string
 	TimeStarted          time.Time
 	IsMapJob             bool
+	Inactive             bool
 	JobNumber            int
 	NReduce              int
-	taskReassignDuration int64
+	TaskReassignDuration int64
 }
 
 func (j *Job) isExpired() bool {
-	return time.Since(j.TimeStarted).Milliseconds() > j.taskReassignDuration
+	return time.Since(j.TimeStarted).Milliseconds() > j.TaskReassignDuration && !j.Inactive
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -97,47 +98,49 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 }
 
 func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
-	var completedJobListM *sync.Mutex
+	var completedJobSetM *sync.Mutex
 	var completedJobSet *set
 
 	changeStage := false
 	reply.Success = true
 	if args.IsMapJob {
-		completedJobListM = &c.completedMapJobsM
+		completedJobSetM = &c.completedMapJobsM
 		completedJobSet = c.completedMapJobs
 	} else {
-		completedJobListM = &c.completedReduceJobsM
+		completedJobSetM = &c.completedReduceJobsM
 		completedJobSet = c.completedReduceJobs
 	}
 
-	completedJobListM.Lock()
+	completedJobSetM.Lock()
 
 	// handle repeat jobs successful
 	if completedJobSet.Contains(args.TaskNumber) {
-		completedJobListM.Unlock()
+		completedJobSetM.Unlock()
 		return nil
 	}
 
 	completedJobSet.Add(args.TaskNumber)
 
 	if args.IsMapJob {
+		log.Printf("Map job: %#v total: %.f%% percent completed\n", args.Job.FileNames, float64(completedJobSet.Size())*100.0/float64(c.totalMapJobs))
 		if completedJobSet.Size() == c.totalMapJobs {
 			log.Println("Map stage completed | Creating reduce tasks")
-			completedJobListM.Unlock()
+			completedJobSetM.Unlock()
 			err := c.createReduceTasks()
 			if err != nil {
 				log.Fatal(err)
 			}
 			changeStage = true
 		} else {
-			completedJobListM.Unlock()
+			completedJobSetM.Unlock()
 		}
 	} else {
+		log.Printf("Reduce job: %#v total: %.f%% completed\n", args.Job.FileNames, float64(completedJobSet.Size())*100.0/float64(c.totalReduceJobs))
 		if completedJobSet.Size() == c.totalReduceJobs {
 			log.Printf("\tThis is the state of completed reducejobs: %#v\n", completedJobSet)
 			changeStage = true
 		}
-		completedJobListM.Unlock()
+		completedJobSetM.Unlock()
 	}
 
 	if changeStage {
@@ -161,13 +164,17 @@ func (c *Coordinator) changeStage() {
 
 }
 
-func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, completedJobs *set, completedJobsM *sync.Mutex, args *RequestTaskArgs, reply *RequestTaskReply) {
-	//c.registeredWorkersM.Lock()
-	jobListLock.Lock()
+func (c *Coordinator) assignJob(jobList *[]Job, jobListM *sync.Mutex, completedJobs *set, completedJobsM *sync.Mutex, args *RequestTaskArgs, reply *RequestTaskReply) {
+	c.registeredWorkersM.Lock()
+	defer c.registeredWorkersM.Unlock()
+	completedJobsM.Lock()
+	defer completedJobsM.Unlock()
+	jobListM.Lock()
+	defer jobListM.Unlock()
+
 	if len(*jobList) == 0 {
 		reply.WorkerWait = true
 		reply.Success = true
-		jobListLock.Unlock()
 		return
 	}
 
@@ -177,15 +184,12 @@ func (c *Coordinator) assignJob(jobList *[]Job, jobListLock *sync.Mutex, complet
 	*jobList = (*jobList)[0 : len(*jobList)-1]
 	reply.Job = job
 
-	//c.registeredWorkers[args.Uuid] = job
-	//c.registeredWorkersM.Unlock()
+	c.registeredWorkers[args.Uuid] = job
 	if len(job.FileNames) == 1 {
 		log.Print("\tGiving worker map task: " + job.FileNames[0] + "\n")
 	} else {
 		log.Printf("\tGiving worker reduce tasks: %#v\n", job.FileNames)
 	}
-	jobListLock.Unlock()
-
 	//if faultTolerance {
 	//	time.Sleep(c.taskReassignDuration)
 	//	completedJobsM.Lock()
@@ -214,62 +218,65 @@ func (c *Coordinator) createReduceTasks() error {
 		job.FileNames = append(job.FileNames, files...)
 		job.JobNumber = i
 		job.IsMapJob = false
+		job.Inactive = false
 		job.NReduce = c.totalReduceJobs
-		job.taskReassignDuration = c.taskReassignDuration
+		job.TaskReassignDuration = c.taskReassignDuration
 		c.reduceJobs = append(c.reduceJobs, job)
 	}
 	log.Println("Finished creating reduce tasks")
 	return nil
 }
 
-//func (c *Coordinator) faultTolerance() {
-//
-//	for {
-//		// TODO: Look here
-//		c.stageM.Lock()
-//		stage := c.stage
-//		c.stageM.Unlock()
-//
-//		if stage == Done {
-//			break
-//		}
-//
-//		c.registeredWorkersM.Lock()
-//
-//		for _, job := range c.registeredWorkers {
-//
-//			var completedJobListM *sync.Mutex
-//			var completedJobSet *set
-//			var jobListM *sync.Mutex
-//			var jobList *[]Job
-//
-//			if job.IsMapJob {
-//				completedJobListM = &c.completedMapJobsM
-//				completedJobSet = c.completedMapJobs
-//				jobListM = &c.mapJobsM
-//				jobList = &c.mapJobs
-//
-//			} else {
-//				completedJobListM = &c.completedReduceJobsM
-//				completedJobSet = c.completedReduceJobs
-//				jobListM = &c.reduceJobsM
-//				jobList = &c.reduceJobs
-//			}
-//
-//			completedJobListM.Lock()
-//
-//			if job.isExpired() && !completedJobSet.Contains(job.JobNumber) {
-//				jobListM.Lock()
-//				*jobList = append(*jobList, job)
-//				jobListM.Unlock()
-//			}
-//
-//			completedJobListM.Unlock()
-//		}
-//		c.registeredWorkersM.Unlock()
-//		time.Sleep(1)
-//	}
-//}
+func (c *Coordinator) faultTolerance() {
+
+	for {
+		c.stageM.Lock()
+		stage := c.stage
+		c.stageM.Unlock()
+
+		if stage == Done {
+			break
+		}
+
+		c.registeredWorkersM.Lock()
+
+		for workerUuid, job := range c.registeredWorkers {
+
+			var completedJobListM *sync.Mutex
+			var completedJobSet *set
+			var jobListM *sync.Mutex
+			var jobList *[]Job
+
+			if job.IsMapJob {
+				completedJobListM = &c.completedMapJobsM
+				completedJobSet = c.completedMapJobs
+				jobListM = &c.mapJobsM
+				jobList = &c.mapJobs
+
+			} else {
+				completedJobListM = &c.completedReduceJobsM
+				completedJobSet = c.completedReduceJobs
+				jobListM = &c.reduceJobsM
+				jobList = &c.reduceJobs
+			}
+
+			completedJobListM.Lock()
+
+			if job.isExpired() && !completedJobSet.Contains(job.JobNumber) {
+				jobListM.Lock()
+				*jobList = append(*jobList, job)
+				jobListM.Unlock()
+				job.Inactive = true
+				c.registeredWorkers[workerUuid] = job
+				log.Printf("Reassigning job with filename: %#v", job.FileNames)
+			}
+
+			completedJobListM.Unlock()
+		}
+		c.registeredWorkersM.Unlock()
+		time.Sleep(1000 * time.Millisecond)
+	}
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -304,10 +311,11 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	if !logging {
-		log.SetFlags(0)
-		log.SetOutput(ioutil.Discard)
+	f, err := os.OpenFile("coordinator-output.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
 	}
+	log.SetOutput(f)
 
 	c := Coordinator{}
 
@@ -317,20 +325,26 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.completedMapJobs = NewSet()
 	c.completedReduceJobs = NewSet()
 	sort.Strings(files)
+	c.taskReassignDuration = 10 * 1000
 	for idx, file := range files {
 		job := Job{}
 		job.FileNames = append(job.FileNames, file)
 		job.JobNumber = idx
 		job.IsMapJob = true
+		job.Inactive = false
 		job.NReduce = nReduce
-		job.taskReassignDuration = c.taskReassignDuration
+		job.TaskReassignDuration = c.taskReassignDuration
 		c.mapJobs = append(c.mapJobs, job)
 	}
 	c.totalMapJobs = len(files)
-	c.taskReassignDuration = 10 * 1000
-	//c.registeredWorkers = make(map[string]Job)
+
+	c.registeredWorkers = make(map[string]Job)
 
 	c.server()
+
+	if faultTolerance2 {
+		go c.faultTolerance()
+	}
 	log.Print("Coordinator running...\n")
 	log.Printf("\t %d files found", c.totalMapJobs)
 	return &c

@@ -35,6 +35,7 @@ type RequestTaskReply struct {
 type TaskDoneArgs struct {
 	TaskNumber int
 	IsMapJob   bool
+	Job        Job
 }
 
 type TaskDoneReply struct {
