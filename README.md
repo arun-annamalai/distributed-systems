@@ -1,4 +1,8 @@
-# mapreduce
-Mapreduce Implementation in GO
+# Distributed Systems
 
-This is a completed MIT course 6.824 mapreduce distributed system framework
+
+This follows the MIT open source course 6.824 distributed system course and includes the following implementations in Golang
+
+Mapreduce
+
+Raft
